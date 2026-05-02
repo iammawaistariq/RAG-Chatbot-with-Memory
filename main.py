@@ -16,18 +16,24 @@ from pinecone import Pinecone, ServerlessSpec
 from langchain_pinecone import PineconeVectorStore
 from langchain_community.chat_message_histories import RedisChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+import json
 
 dotenv.load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 REDIS_URL = os.getenv("REDIS_URL")
-INDEX_NAME = "iqrar-rag"
+
+
+INDEX_NAME = "chatbot-rag-history"
 EMBED_MODEL = "all-MiniLM-L6-v2"
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
-TOP_K = 3
-INDEXED_FILES_KEY = "iqrar_indexed_files"
+TOP_K = 15
+
+INDEXED_FILES_KEY = "Indexed_Files_Data"
 
 # Initialize Redis client for tracking indexed files
 try:
@@ -37,7 +43,59 @@ except redis.ConnectionError:
     print(f"[WARNING] Could not connect to Redis at {REDIS_URL}. Ensure Redis is running.")
     redis_client = None
 
+
+####################################################################################
+# Optimized Memory Management (Content-only + Sliding Window)
+####################################################################################
+class SimpleRedisHistory(BaseChatMessageHistory):
+    """
+    Optimized Redis history:
+    1. Stores only 'role' and 'content' (no metadata).
+    2. Implements a sliding window (max 100 messages) for better memory management.
+    """
+    def __init__(self, session_id: str, url: str, max_messages: int = 100):
+        self.session_id = f"chat_memory:{session_id}"
+        self.client = redis.Redis.from_url(url, decode_responses=True)
+        self.max_messages = max_messages
+
+    @property
+    def messages(self):
+        items = self.client.lrange(self.session_id, 0, -1)
+        msgs = []
+        for item in items:
+            try:
+                data = json.loads(item)
+                role, content = data.get("role"), data.get("content", "")
+                if role == "human":
+                    msgs.append(HumanMessage(content=content))
+                else:
+                    msgs.append(AIMessage(content=content))
+            except Exception:
+                continue
+        return msgs
+
+    def add_message(self, message: BaseMessage):
+        # Store only role and content
+        role = "human" if isinstance(message, HumanMessage) else "ai"
+        data = json.dumps({"role": role, "content": message.content})
+        
+        # Push to list and trim to maintain sliding window
+        self.client.rpush(self.session_id, data)
+        if self.client.llen(self.session_id) > self.max_messages:
+            self.client.lpop(self.session_id)
+
+    def clear(self):
+        self.client.delete(self.session_id)
+
+
+
+
+
+####################################################################################
+# PineCone Setup
+####################################################################################
 def init_pinecone():
+    """Ensures the Pinecone index exists, creating it if necessary."""
     pc = Pinecone(api_key=PINECONE_API_KEY)
     if INDEX_NAME not in pc.list_indexes().names():
         pc.create_index(
@@ -53,6 +111,8 @@ def get_embeddings():
     return HuggingFaceEmbeddings(model_name=EMBED_MODEL)
 
 def get_vectorstore():
+    # Ensure index exists before accessing it
+    init_pinecone()
     return PineconeVectorStore.from_existing_index(
         index_name=INDEX_NAME,
         embedding=get_embeddings()
@@ -82,7 +142,8 @@ def add_document(file_path):
         docs = splitter.split_documents(documents)
         
         for doc in docs:
-            doc.metadata["source"] = filename
+            # Store only 'source' and strip other metadata (like page numbers, local paths)
+            doc.metadata = {"source": filename}
         
         PineconeVectorStore.from_documents(
             documents=docs,
@@ -110,6 +171,10 @@ def delete_document(filename):
     except Exception as e:
         return f"Error deleting '{filename}': {str(e)}", gr.update(choices=get_indexed_files())
 
+
+####################################################################################
+# RAG Chain Setup
+####################################################################################
 def setup_rag_chain():
     llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.25)
     vectorstore = get_vectorstore()
@@ -145,7 +210,8 @@ def setup_rag_chain():
     rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
 
     def get_session_history(session_id: str):
-        return RedisChatMessageHistory(session_id, url=REDIS_URL)
+        # This is the "element" that determines how data is sent to Redis
+        return SimpleRedisHistory(session_id, url=REDIS_URL, max_messages=10)
 
     conversational_rag_chain = RunnableWithMessageHistory(
         rag_chain,
@@ -160,7 +226,7 @@ rag_chain = setup_rag_chain()
 
 def clear_memory(session_id="default"):
     try:
-        history = RedisChatMessageHistory(session_id, url=REDIS_URL)
+        history = SimpleRedisHistory(session_id, url=REDIS_URL)
         history.clear()
     except Exception:
         pass
@@ -168,9 +234,12 @@ def clear_memory(session_id="default"):
 
 import traceback
 
+####################################################################################
+# Gradio Interface
+####################################################################################
 def build_ui():
-    with gr.Blocks(title="Iqrar RAG System") as demo:
-        gr.Markdown("# Iqrar RAG Interface")
+    with gr.Blocks(title="Chatbot RAG System with Memory") as demo:
+        gr.Markdown("# Chatbot RAG System with Memory")
         with gr.Row():
             # Left Column: Document Management
             with gr.Column(scale=1, min_width=300):
@@ -199,7 +268,9 @@ def build_ui():
                     files = get_indexed_files()
                     if not files:
                         return "No files indexed yet."
-                    return "\n".join([f"- {f}" for f in files])
+                    # Sort alphabetically and display with numbering
+                    files = sorted(files)
+                    return "\n".join([f"{i+1}. {f}" for i, f in enumerate(files)])
 
                 # Callbacks
                 upload_btn.click(
@@ -209,7 +280,6 @@ def build_ui():
                 ).then(fn=update_display, outputs=indexed_files_display)
                 
                 def handle_delete(filename):
-                    print(f"[LOG] Attempting to delete: {filename}")
                     if not filename:
                         return "No filename provided."
                     if not redis_client or not redis_client.sismember(INDEXED_FILES_KEY, filename):
@@ -245,8 +315,6 @@ def build_ui():
                     clear_btn = gr.Button("Clear Chat")
 
                 def user_message(user_msg, history):
-                    print(f"[LOG] User message received: {user_msg}")
-                    print(f"[LOG] Current history type: {type(history)}, content: {history}")
                     history = history or []
                     # Gradio 6+ standard format
                     history.append({"role": "user", "content": user_msg})
@@ -272,12 +340,25 @@ def build_ui():
                         elif not isinstance(user_msg, str):
                             user_msg = str(user_msg)
 
-                        print(f"[LOG] Processing parsed message: {user_msg}")
                         response = rag_chain.invoke(
                             {"input": user_msg},
                             config={"configurable": {"session_id": "default"}}
                         )
-                        print(f"[LOG] RAG Chain Output: {response}")
+                        
+                        # --- Improved Printing ---
+                        print(f"\n{'='*50}")
+                        print(f"USER QUERY: {user_msg}")
+                        
+                        docs = response.get("context", [])
+                        print(f"RETRIEVED: {len(docs)} chunks")
+                        for i, doc in enumerate(docs):
+                            source = doc.metadata.get('source', 'Unknown')
+                            snippet = doc.page_content.replace('\n', ' ')[:80]
+                            print(f"  [{i+1}] Source: {source} | Snippet: {snippet}...")
+                        
+                        print(f"AI ANSWER: {response['answer']}")
+                        print(f"{'='*50}\n")
+                        
                         history.append({"role": "assistant", "content": response["answer"]})
                     except Exception as e:
                         print("[ERROR] Exception in RAG chain:")
