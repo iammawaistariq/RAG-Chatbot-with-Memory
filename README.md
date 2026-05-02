@@ -1,8 +1,8 @@
-# Iqrar RAG System
+# Chatbot RAG System with Memory
 
 A robust Retrieval-Augmented Generation (RAG) web application built using **LangChain**, **Gradio 6**, **Pinecone**, and **OpenAI**. The system allows users to upload PDF documents, index them, and interactively query the knowledge base with full conversational memory.
 
-## 🌟 Features
+## Features
 
 - **Document Management:** Easily upload, index, and delete PDF files directly from the UI.
 - **Conversational AI:** Powered by OpenAI's `gpt-3.5-turbo`, enabling intelligent and context-aware responses.
@@ -51,7 +51,6 @@ PINECONE_API_KEY="your_pinecone_api_key_here"
 REDIS_URL="redis://your_redis_url_here" 
 # Example: redis://default:password@host:port/0
 ```
-*(Note: If `REDIS_URL` is not provided in `.env`, the app will default to the fallback URL specified in `main.py`.)*
 
 ### 4. Run the Application
 Start the Gradio server:
