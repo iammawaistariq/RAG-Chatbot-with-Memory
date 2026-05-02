@@ -1,0 +1,12 @@
+langchain==1.2.16
+langchain-community==0.4.1
+langchain-openai
+pinecone==6.0.0
+langchain-pinecone==0.2.13
+sentence-transformers==5.4.1
+pypdf==6.10.2
+langchain-huggingface==1.2.2
+
+python-dotenv==1.2.2
+gradio
+redis
